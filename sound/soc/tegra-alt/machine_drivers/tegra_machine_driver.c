@@ -422,6 +422,9 @@ static int tegra_machine_rt5640_init(struct snd_soc_pcm_runtime *rtd)
 		return err;
 	}
 
+	/* single button supporting play/pause */
+	snd_jack_set_key(jack->jack, SND_JACK_BTN_0, KEY_PLAYPAUSE);
+
 	snd_soc_dapm_sync(&card->dapm);
 
 	return 0;

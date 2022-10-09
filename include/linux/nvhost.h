@@ -35,6 +35,8 @@
 
 #include <uapi/linux/nvdev_fence.h>
 
+#include <linux/platform/tegra/tegra_mc.h>
+
 #ifdef CONFIG_TEGRA_HOST1X
 #include <linux/host1x.h>
 #endif
@@ -365,6 +367,9 @@ struct nvhost_device_data {
 
 	phys_addr_t carveout_addr;
 	phys_addr_t carveout_size;
+
+	enum carveout_desc carveout_idx;
+	bool carveout_use_top;
 
 	/* Information related to engine-side synchronization */
 	void *syncpt_unit_interface;

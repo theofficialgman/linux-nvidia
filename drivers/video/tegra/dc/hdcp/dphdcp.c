@@ -108,7 +108,8 @@ static DECLARE_WAIT_QUEUE_HEAD(wq_worker);
 #define HDCP_KEY_LOAD			0x100
 #define KFUSE_MASK			0x10
 
-#define HDCP11_SRM_PATH			"vendor/etc/hdcpsrm/hdcp1x.srm"
+#define HDCP_FALLBACK_1X                0xdeadbeef
+#define HDCP_NON_22_RX                  0x0300
 
 #define CP_IRQ_OFFSET			(1 << 2)
 #define CP_IRQ_RESET			0x4
@@ -137,6 +138,17 @@ static DECLARE_WAIT_QUEUE_HEAD(wq_worker);
 static bool repeater_flag;
 static bool vprime_check_done;
 static struct tegra_dphdcp **dphdcp_head;
+static u8 g_fallback;
+
+#ifndef CONFIG_TRUSTY
+static int te_launch_trusted_oper(void *buf, size_t buf_len, uint32_t ta_cmd,
+		void *ctx)
+{
+	return 0;
+}
+int te_open_trusted_session(char *name, void **ctx) { return 0; }
+void te_close_trusted_session(void *ctx) {}
+#endif
 
 static int tegra_dphdcp_read(struct tegra_dc_dp_data *dp, u32 cmd,
 	u8 *data_ptr, u32 size, u32 *aux_status)
@@ -706,9 +718,12 @@ static int get_srm_signature(struct hdcp_context_t *hdcp_context,
 {
 	int err = 0;
 
-	if (!hdcp_context || !nonce || !pkt || !ta_ctx) {
+	if (!ta_ctx)
+		return 0;
+
+	if (!hdcp_context || !nonce || !pkt) {
 		dphdcp_err("Null params sent!\n");
-		return err;
+		return -EINVAL;
 	}
 	/* generate nonce in the ucode */
 	err = tsec_hdcp_generate_nonce(hdcp_context, nonce);
@@ -731,6 +746,8 @@ static int srm_revocation_check(struct tegra_dphdcp *dphdcp)
 	struct hdcp_context_t *hdcp_context =
 		kmalloc(sizeof(struct hdcp_context_t), GFP_KERNEL);
 	int e = 0;
+	int tsec_addr = 0;
+	unsigned char *cmac = NULL;
 	unsigned char nonce[HDCP_NONCE_SIZE];
 
 	uint64_t *pkt = kzalloc(PKT_SIZE, GFP_KERNEL);
@@ -744,22 +761,17 @@ static int srm_revocation_check(struct tegra_dphdcp *dphdcp)
 		dphdcp_err("hdcp context create/init failed\n");
 		goto exit;
 	}
-
-	e =  tsec_hdcp_create_session(hdcp_context, DISPLAY_TYPE_DP,
-				dphdcp->dp->sor->ctrl_num);
-	if (e) {
-		dphdcp_err("error in session creation\n");
-		goto exit;
-	}
 	e = get_srm_signature(hdcp_context, nonce, pkt, dphdcp->ta_ctx);
 	if (e) {
 		dphdcp_err("Error getting srm signature!\n");
 		goto exit;
 	}
-	e = tsec_hdcp_revocation_check(hdcp_context,
-			(unsigned char *)(pkt + HDCP_CMAC_OFFSET),
-			*((unsigned int *)(pkt + HDCP_TSEC_ADDR_OFFSET)),
-			TEGRA_NVHDCP_PORT_DP, HDCP_1x);
+	if (dphdcp->ta_ctx) {
+		tsec_addr = *((unsigned int *)(pkt + HDCP_TSEC_ADDR_OFFSET));
+		cmac = (unsigned char *)(pkt + HDCP_CMAC_OFFSET);
+	}
+	e = tsec_hdcp_revocation_check(hdcp_context, cmac, tsec_addr,
+				       TEGRA_NVHDCP_PORT_DP, HDCP_1x);
 
 	if (e)
 		dphdcp_err("hdcp revocation check failed with err: %x\n", e);
@@ -1107,11 +1119,12 @@ repeater_auth:
 				dphdcp_vdbg("Aksv is 0x%016llx\n", dphdcp->a_ksv);
 				dphdcp_vdbg("An is 0x%016llx\n", dphdcp->a_n);
 				/* check if verification of Aksv failed */
-			if (hdcp_ta_ret) {
-				dphdcp_err("Aksv verify failure\n");
-				goto disable;
+				if (hdcp_ta_ret) {
+					dphdcp_err("Aksv verify failure\n");
+					goto disable;
+				}
 			}
-		} }
+		}
 	} else {
 		set_bksv(sor, 0, (b_caps & BCAPS_REPEATER));
 		e = load_kfuse(dp);
@@ -1363,12 +1376,12 @@ failure:
 	if (dphdcp->fail_count > dphdcp->max_retries)
 		dphdcp_err("dphdcp failure- too many failures, giving up\n");
 	else {
-		dphdcp_err("dphdcp failure- renegotiating in 1 second\n");
 		if (!dphdcp_is_plugged(dphdcp))
 			goto lost_dp;
 
+		dphdcp_err("dphdcp failure- renegotiating...\n");
 		queue_delayed_work(dphdcp->downstream_wq, &dphdcp->work,
-						msecs_to_jiffies(1000));
+			msecs_to_jiffies(dphdcp->fail_count == 1 ? 1 : 1000));
 	}
 
 	/* Failed because of lack of memory */
@@ -1424,7 +1437,6 @@ disable:
 	tegra_dc_io_end(dc);
 }
 
-#ifdef DPHDCP22
 /* HDCP 2.2 over display port */
 
 /* write N bytes of data over AUX channel */
@@ -1578,7 +1590,7 @@ static int dphdcp_lc_init_send(struct tegra_dc_dp_data *dp, u64 *buf)
 static int dphdcp_ake_pairing_info_receive(struct tegra_dc_dp_data *dp,
 							u64 *buf)
 {
-	return tegra_dphdcp_read_n(dp, NV_DPCD_HDCP_LPRIME,
+	return tegra_dphdcp_read_n(dp, NV_DPCD_HDCP_EKM_PAIRING,
 						buf, 16);
 }
 
@@ -1616,6 +1628,12 @@ static int dphdcp_vprime_recv(struct tegra_dc_dp_data *dp, u16 *buf)
 static int dphdcp_recvrid_list_recv(struct tegra_dc_dp_data *dp, u64 *buf)
 {
 	return tegra_dphdcp_read_n(dp, NV_DPCD_HDCP_RX_ID_LIST, buf, 635);
+}
+
+static int dphdcp_strmct_type_send(struct tegra_dc_dp_data *dp, u8 *buf)
+{
+	return tegra_dphdcp_write_n(dp, NV_DPCD_HDCP_STRMCT_TYPE,
+					(u64 *)buf, 1);
 }
 
 static int dphdcp_rptr_ack_send(struct tegra_dc_dp_data *dp, u64 *buf)
@@ -1705,7 +1723,8 @@ static int dphdcp_poll_ready(struct tegra_dc_dp_data *dp,
 static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 				struct hdcp_context_t *hdcp_context)
 {
-	int err = 0;
+	int err = 0, tries = 0;
+	u8 stream_type = 1; /* Force hdcp 2.2 only on repeaters */
 	u8 version = 0x02;
 	u16 caps = 0;
 	u16 txcaps = 0x0;
@@ -1720,7 +1739,7 @@ static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 		goto exit;
 	/* rtx populated in hdcp create session */
 	err = tsec_hdcp_create_session(hdcp_context, DISPLAY_TYPE_DP,
-					dphdcp->dp->sor->ctrl_num);
+					dp->sor->ctrl_num);
 	if (err)
 		goto exit;
 	err = tsec_hdcp_exchange_info(hdcp_context,
@@ -1759,6 +1778,13 @@ static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 	if (err)
 		goto exit;
 
+	err = tsec_hdcp_exchange_info(hdcp_context,
+		HDCP_EXCHANGE_INFO_SET_RCVR_INFO,
+		&hdcp_context->msg.rxcaps_version,
+		&hdcp_context->msg.rxcaps_capmask);
+	if (err)
+		goto exit;
+
 	/* verify received certificate */
 	err = tsec_hdcp_verify_cert(hdcp_context);
 	if (err)
@@ -1776,18 +1802,6 @@ static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 	if (err)
 		goto exit;
 
-	err = tsec_hdcp_exchange_info(hdcp_context,
-		HDCP_EXCHANGE_INFO_SET_RCVR_INFO,
-		&hdcp_context->msg.rxcaps_version,
-		&hdcp_context->msg.rxcaps_capmask);
-
-	if (err)
-		goto exit;
-
-	/* device in revocation list ? */
-	err = tsec_hdcp_revocation_check(hdcp_context);
-	if (err)
-		goto exit;
 	/* H' should be ready within 1 sec */
 	err = dphdcp_poll_ready(dp, 1000);
 	if (err)
@@ -1800,6 +1814,13 @@ static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 	err = tsec_hdcp_verify_hprime(hdcp_context);
 	if (err)
 		goto exit;
+
+	/* device in revocation list ? */
+	err = tsec_hdcp_revocation_check(hdcp_context, NULL, 0,
+					 TEGRA_NVHDCP_PORT_DP, HDCP_22);
+	if (err)
+		goto exit;
+
 	/* wait for AKE pairing message to be ready */
 	err = dphdcp_poll_ready(dp, 200);
 	if (err)
@@ -1807,10 +1828,6 @@ static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 
 	err = dphdcp_ake_pairing_info_receive(dp,
 		(u64 *)hdcp_context->msg.ekhkm);
-	if (err)
-		goto exit;
-
-	err = tsec_hdcp_encrypt_pairing_info(hdcp_context);
 	if (err)
 		goto exit;
 
@@ -1826,9 +1843,7 @@ static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 	if (err)
 		goto exit;
 
-	err = dphdcp_poll_ready(dp, 7);
-	if (err)
-		goto exit;
+	msleep(10);
 
 	err = dphdcp_lc_lprime_receive(dp, (u64 *)hdcp_context->msg.lprime);
 	if (err)
@@ -1862,6 +1877,17 @@ static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 		if (err)
 			goto exit;
 
+		if (hdcp_context->msg.rxinfo & HDCP_NON_22_RX) {
+			err = HDCP_FALLBACK_1X;
+			goto exit;
+		}
+
+		/* Unknown check */
+		if (hdcp_context->msg.rxinfo & 0x0C00) {
+			err = -EINVAL;
+			goto exit;
+		}
+
 		err = dphdcp_seqnum_recv(dp, (u64 *)hdcp_context->msg.seq_num);
 		if (err)
 			goto exit;
@@ -1875,7 +1901,8 @@ static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 		if (err)
 			goto exit;
 
-		err = tsec_hdcp_verify_vprime(hdcp_context);
+		err = tsec_hdcp_verify_vprime(hdcp_context, NULL, 0,
+					      TEGRA_NVHDCP_PORT_DP);
 		if (err)
 			goto exit;
 
@@ -1884,35 +1911,48 @@ static int tsec_hdcp_authentication(struct tegra_dc_dp_data *dp,
 		if (err)
 			goto exit;
 
-		err = tsec_hdcp_rptr_stream_manage(hdcp_context);
-		if (err)
-			goto exit;
-		/* One stream */
-		hdcp_context->msg.k = 0x0100;
-		/* STREAM_ID and Type are 0 */
-		hdcp_context->msg.streamid_type[0] = 0x0000;
-		/* stream management information */
-		err = dphdcp_rptr_seqnum_send(dp,
-			hdcp_context->msg.seq_num_m);
-		if (err)
-			goto exit;
+		do {
+			err = tsec_hdcp_rptr_stream_manage(hdcp_context);
+			if (err)
+				goto exit;
+			/* One stream */
+			hdcp_context->msg.k = 0x0100;
+			/* STREAM_ID is 0 and Type is 1 */
+			hdcp_context->msg.streamid_type[0] = 0x0100;
+			/* stream management information */
+			err = dphdcp_rptr_seqnum_send(dp,
+				hdcp_context->msg.seq_num_m);
+			if (err)
+				goto exit;
 
-		err = dphdcp_rptr_k_send(dp,
-			&hdcp_context->msg.k);
+			err = dphdcp_rptr_k_send(dp,
+				&hdcp_context->msg.k);
+			if (err)
+				goto exit;
+
+			err = dphdcp_rptr_strmid_type_send(dp,
+				hdcp_context->msg.streamid_type);
+			if (err)
+				goto exit;
+
+			msleep(100);
+
+			/* repeater auth stream ready information */
+			err = dphdcp_rptr_stream_ready_recv(dp,
+					hdcp_context->msg.mprime);
+			if (err)
+				goto exit;
+
+			err = tsec_hdcp_rptr_stream_ready(hdcp_context);
+
+			tries++;
+		} while (err && tries < 2);
+
 		if (err)
 			goto exit;
-
-		err = dphdcp_rptr_strmid_type_send(dp,
-			hdcp_context->msg.streamid_type);
-		if (err)
-			goto exit;
-
-		/* repeater auth stream ready information */
-		err = dphdcp_rptr_stream_ready_recv(dp,
-				hdcp_context->msg.mprime);
-		if (err)
-			goto exit;
-
+	} else {
+		/* set content type (only for 2.2, so don't check err) */
+		dphdcp_strmct_type_send(dp, &stream_type);
 	}
 	dphdcp_info("HDCP authentication successful\n");
 exit:
@@ -1954,10 +1994,27 @@ static void dphdcp2_downstream_worker(struct work_struct *work)
 	dphdcp_vdbg("%s():hpd=%d\n", __func__, dphdcp->plugged);
 	mutex_unlock(&dphdcp->lock);
 
-	if (tsec_hdcp_authentication(dp, &hdcp_context)) {
+	e = tsec_hdcp_authentication(dp, &hdcp_context);
+	if (e == HDCP_FALLBACK_1X) {
+		dphdcp_info("falling back to hdcp 1.x\n");
+
+		mutex_lock(&dphdcp->lock);
+		dphdcp->state = STATE_UNAUTHENTICATED;
+		g_fallback = 1;
+		mutex_unlock(&dphdcp->lock);
+
+		tegra_dc_io_end(dc);
+		tsec_hdcp_free_context(&hdcp_context);
+
+		queue_delayed_work(dphdcp->downstream_wq, &dphdcp->work,
+						msecs_to_jiffies(10));
+		return;
+	} else if (e) {
 		mutex_lock(&dphdcp->lock);
 		goto failure;
 	}
+
+	msleep(350);
 
 	mutex_lock(&dphdcp->lock);
 	dphdcp->state = STATE_LINK_VERIFY;
@@ -1990,7 +2047,7 @@ static void dphdcp2_downstream_worker(struct work_struct *work)
 		}
 		tegra_dc_io_end(dc);
 		wait_event_interruptible_timeout(wq_worker,
-		!dphdcp_is_plugged(dphdcp), msecs_to_jiffies(200));
+			!dphdcp_is_plugged(dphdcp), msecs_to_jiffies(200));
 		tegra_dc_io_start(dc);
 		mutex_lock(&dphdcp->lock);
 	}
@@ -2000,12 +2057,12 @@ failure:
 	if (dphdcp->fail_count > dphdcp->max_retries) {
 		dphdcp_err("dphdcp failure - too many failures, giving up\n");
 	} else {
-		dphdcp_err("dphdcp failure - renegotiating in 1 sec\n");
+		dphdcp_err("dphdcp failure - renegotiating...\n");
 		if (!dphdcp_is_plugged(dphdcp))
 			goto lost_dp;
 
 		queue_delayed_work(dphdcp->downstream_wq, &dphdcp->work,
-						msecs_to_jiffies(1000));
+			msecs_to_jiffies(dphdcp->fail_count == 1 ? 1 : 1000));
 	}
 
 lost_dp:
@@ -2016,7 +2073,6 @@ err:
 	tegra_dc_io_end(dc);
 	e = tsec_hdcp_free_context(&hdcp_context);
 }
-#endif
 
 static void dphdcp_downstream_worker(struct work_struct *work)
 {
@@ -2034,15 +2090,13 @@ static void dphdcp_downstream_worker(struct work_struct *work)
 		dphdcp_err("dphdcp i2c HDCP22 version read failed\n");
 
 	dphdcp_vdbg("read back version:%x\n", hdcp2version);
-#ifdef DPHDCP22
-	if (hdcp2version & HDCP_HDCP2_VERSION_HDCP22_YES) {
+	if (hdcp2version & HDCP_HDCP2_VERSION_HDCP22_YES && !g_fallback) {
 		dphdcp->hdcp22 = HDCP22_PROTOCOL;
 		dphdcp2_downstream_worker(work);
-		return;
+	} else {
+		dphdcp->hdcp22 = HDCP1X_PROTOCOL;
+		dphdcp1_downstream_worker(work);
 	}
-#endif
-	dphdcp->hdcp22 = HDCP1X_PROTOCOL;
-	dphdcp1_downstream_worker(work);
 }
 
 static int tegra_dphdcp_on(struct tegra_dphdcp *dphdcp)
@@ -2139,6 +2193,8 @@ void tegra_dphdcp_set_plug(struct tegra_dphdcp *dphdcp, bool hpd)
 	/* ensure all previous values are reset on hotplug */
 	vprime_check_done = false;
 	repeater_flag = false;
+	dphdcp->hpd = hpd;
+	g_fallback = 0;
 	dphdcp_debug("DP hotplug detected (hpd = %d)\n", hpd);
 
 	if (atomic_read(&dphdcp->policy) != TEGRA_DC_HDCP_POLICY_ALWAYS_OFF) {
@@ -2149,6 +2205,24 @@ void tegra_dphdcp_set_plug(struct tegra_dphdcp *dphdcp, bool hpd)
 			tegra_dphdcp_off(dphdcp);
 		}
 	}
+}
+
+static int tegra_nvhdcp_recv_capable(struct tegra_dphdcp *dphdcp)
+{
+	if (!dphdcp)
+		return 0;
+
+	if (dphdcp->state == STATE_LINK_VERIFY)
+		return 1;
+	else {
+		__u64 b_ksv;
+		/* get Bksv from receiver */
+		if (!tegra_dphdcp_read40(dphdcp->dp, NV_DPCD_HDCP_BKSV_OFFSET,
+					 &b_ksv)) {
+			return !verify_ksv(b_ksv);
+		}
+	}
+	return 0;
 }
 
 static long dphdcp_dev_ioctl(struct file *filp,
@@ -2177,18 +2251,28 @@ static long dphdcp_dev_ioctl(struct file *filp,
 		break;
 
 	case TEGRAIO_NVHDCP_HDCP_STATE:
-		pkt = kmalloc(sizeof(*pkt), GFP_KERNEL);
+		pkt = kzalloc(sizeof(*pkt), GFP_KERNEL);
 		if (!pkt) {
 			kfree(pkt);
 			return -ENOMEM;
 		}
 		e = get_dphdcp_state(dphdcp, pkt);
+		pkt->a_n = dphdcp->a_n;
 		if (copy_to_user((void __user *)arg, pkt, sizeof(*pkt))) {
 			kfree(pkt);
 			return -EFAULT;
 		}
 		kfree(pkt);
 		return e;
+
+	case TEGRAIO_NVHDCP_RECV_CAPABLE:
+		{
+		__u32 recv_capable = tegra_nvhdcp_recv_capable(dphdcp);
+		if (copy_to_user((void __user *)arg, &recv_capable,
+			sizeof(recv_capable)))
+			return -EFAULT;
+		return 0;
+		}
 
 	}
 	return e;
@@ -2199,7 +2283,42 @@ static int dphdcp_dev_open(struct inode *inode, struct file *filp)
 	struct miscdevice *miscdev = filp->private_data;
 	struct tegra_dphdcp *dphdcp =
 		container_of(miscdev, struct tegra_dphdcp, miscdev);
+#ifndef CONFIG_ANDROID
+	bool enabled = atomic_read(&dphdcp->policy) ==
+				TEGRA_DC_HDCP_POLICY_ALWAYS_ON;
+	int retry = 30;
+	int err = 0;
+#endif
 	filp->private_data = dphdcp;
+
+/* enable policy only if HDCP TA is ready */
+#ifndef CONFIG_ANDROID
+	if (!dphdcp->policy_initialized) {
+		dphdcp->policy_initialized = true;
+
+		err = te_open_trusted_session(HDCP_PORT_NAME, &dphdcp->ta_ctx);
+		if (dphdcp->ta_ctx) {
+			te_close_trusted_session(dphdcp->ta_ctx);
+			dphdcp->ta_ctx = NULL;
+		}
+
+		if (!err && !enabled) {
+			mutex_lock(&dphdcp->lock);
+			if (dphdcp->dp->enabled && dphdcp->hpd)
+				dphdcp_set_plugged(dphdcp, dphdcp->dp->enabled);
+			mutex_unlock(&dphdcp->lock);
+			tegra_dphdcp_set_policy(dphdcp,
+				TEGRA_DC_HDCP_POLICY_ALWAYS_ON);
+
+			/* Wait max 3 seconds for dchp to be enabled */
+			while (retry && dphdcp->dp->enabled && dphdcp->hpd &&
+			       dphdcp->state != STATE_LINK_VERIFY) {
+				msleep(100);
+				retry--;
+			}
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -2212,11 +2331,11 @@ static int dphdcp_dev_release(struct inode *inode, struct file *filp)
 static const struct file_operations dphdcp_fops = {
 	.owner			= THIS_MODULE,
 	.llseek			= no_llseek,
-	.unlocked_ioctl = dphdcp_dev_ioctl,
+	.unlocked_ioctl		= dphdcp_dev_ioctl,
 	.open			= dphdcp_dev_open,
-	.release        = dphdcp_dev_release,
+	.release		= dphdcp_dev_release,
 #ifdef CONFIG_COMPAT
-	.compat_ioctl	= dphdcp_dev_ioctl,
+	.compat_ioctl		= dphdcp_dev_ioctl,
 #endif
 };
 /* we only support one AP right now, so should only call this once. */
@@ -2376,6 +2495,7 @@ static ssize_t tegra_dp_hotplug_dbg_write(struct file *file,
 	if (ret < 0)
 		return ret;
 
+	g_fallback = 0;
 	if (new_hpd > 0) {
 		/* start downstream_worker */
 		dphdcp_set_plugged(dphdcp, true);

@@ -209,6 +209,7 @@ struct tegra210_i2s {
 	bool loopback;
 	unsigned int format;
 	unsigned int rx_fifo_th; /* should be programmed interms of frames */
+	void __iomem *base_addr;
 };
 
 #endif

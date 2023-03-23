@@ -95,18 +95,20 @@ static int tegra210_mixer_runtime_resume(struct device *dev)
 }
 
 static int tegra210_mixer_write_ram(struct tegra210_mixer *mixer,
-				    unsigned int addr,
-				    unsigned int coef)
+				unsigned int addr,
+				unsigned int val)
 {
-	unsigned int reg, val;
-	int ret;
+	unsigned int reg, value, wait = 0xffff;
 
 	/* check if busy */
-	ret = regmap_read_poll_timeout(mixer->regmap,
-			TEGRA210_MIXER_AHUBRAMCTL_GAIN_CONFIG_RAM_CTRL,
-			val, !(val & 0x80000000), 10, 10000);
-	if (ret < 0)
-		return ret;
+	do {
+		regmap_read(mixer->regmap,
+				TEGRA210_MIXER_AHUBRAMCTL_GAIN_CONFIG_RAM_CTRL, &value);
+		wait--;
+		if (!wait)
+			return -EINVAL;
+	} while (value & 0x80000000);
+	value = 0;
 
 	reg = (addr << TEGRA210_MIXER_AHUBRAMCTL_GAIN_CONFIG_RAM_CTRL_RAM_ADDR_SHIFT) &
 			TEGRA210_MIXER_AHUBRAMCTL_GAIN_CONFIG_RAM_CTRL_RAM_ADDR_MASK;
@@ -115,11 +117,9 @@ static int tegra210_mixer_write_ram(struct tegra210_mixer *mixer,
 	reg |= TEGRA210_MIXER_AHUBRAMCTL_GAIN_CONFIG_RAM_CTRL_SEQ_ACCESS_EN;
 
 	regmap_write(mixer->regmap,
-		     TEGRA210_MIXER_AHUBRAMCTL_GAIN_CONFIG_RAM_CTRL,
-		     reg);
+		TEGRA210_MIXER_AHUBRAMCTL_GAIN_CONFIG_RAM_CTRL, reg);
 	regmap_write(mixer->regmap,
-		     TEGRA210_MIXER_AHUBRAMCTL_GAIN_CONFIG_RAM_DATA,
-		     coef);
+		TEGRA210_MIXER_AHUBRAMCTL_GAIN_CONFIG_RAM_DATA, val);
 
 	return 0;
 }

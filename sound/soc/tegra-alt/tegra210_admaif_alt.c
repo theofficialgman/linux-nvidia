@@ -16,8 +16,10 @@
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
@@ -429,8 +431,8 @@ static int tegra_admaif_stop(struct snd_soc_dai *dai, int direction)
 	regmap_update_bits(admaif->regmap, enable_reg, mask, ~enable);
 
 	/* wait until ADMAIF TX/RX status is disabled */
-	ret = regmap_read_poll_timeout_atomic(admaif->regmap, status_reg, val,
-					      !(val & enable), 10, 10000);
+	ret = readl_poll_timeout_atomic(REG_IOVA(status_reg), val,
+					!(val & enable), 10, 10000);
 
 	/* Timeout may be hit if sink gets closed/blocked ahead of source */
 	if (ret < 0)
@@ -441,9 +443,9 @@ static int tegra_admaif_stop(struct snd_soc_dai *dai, int direction)
 	regmap_update_bits(admaif->regmap, reset_reg, SW_RESET_MASK, SW_RESET);
 
 	/* wait till SW reset is complete */
-	ret = regmap_read_poll_timeout_atomic(admaif->regmap, reset_reg, val,
-					      !(val & SW_RESET_MASK & SW_RESET),
-					      10, 10000);
+	ret = readl_poll_timeout_atomic(REG_IOVA(reset_reg), val,
+					!(val & SW_RESET_MASK & SW_RESET),
+					10, 10000);
 	if (ret < 0) {
 		dev_err(dai->dev, "timeout: SW reset failed for ADMAIF%d_%s\n",
 			dai->id + 1, dir_name);

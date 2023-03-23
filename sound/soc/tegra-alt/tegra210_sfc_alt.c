@@ -28,6 +28,7 @@
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
 #include <linux/of_device.h>
+#include <linux/delay.h>
 
 #include "tegra210_xbar_alt.h"
 #include "tegra210_sfc_alt.h"
@@ -3013,19 +3014,20 @@ static int tegra210_sfc_set_audio_cif(struct tegra210_sfc *sfc,
 static int tegra210_sfc_soft_reset(struct tegra210_sfc *sfc)
 {
 	u32 val;
-	int ret;
+	int cnt = 10;
+	int ret = 0;
 
-	/* SW reset */
-	regmap_update_bits(sfc->regmap, TEGRA210_SFC_SOFT_RESET,
-			   TEGRA210_SFC_SOFT_RESET_EN, 1);
-
-	ret = regmap_read_poll_timeout(sfc->regmap, TEGRA210_SFC_SOFT_RESET,
-				       val, !(val & TEGRA210_SFC_SOFT_RESET_EN),
-				       10, 10000);
-	if (ret < 0)
-		return ret;
-
-	return 0;
+	regmap_update_bits(sfc->regmap,
+			TEGRA210_SFC_SOFT_RESET,
+			TEGRA210_SFC_SOFT_RESET_EN,
+			1);
+	do {
+		udelay(100);
+		regmap_read(sfc->regmap, TEGRA210_SFC_SOFT_RESET, &val);
+	} while ((val & TEGRA210_SFC_SOFT_RESET_EN) && cnt--);
+	if (!cnt)
+		ret = -ETIMEDOUT;
+	return ret;
 }
 
 static int tegra210_sfc_in_hw_params(struct snd_pcm_substream *substream,
@@ -3042,10 +3044,8 @@ static int tegra210_sfc_in_hw_params(struct snd_pcm_substream *substream,
 			0);
 
 	ret = tegra210_sfc_soft_reset(sfc);
-	if (ret < 0) {
-		dev_err(dev, "failed to reset SFC in %s, err = %d\n",
-			__func__, ret);
-
+	if (ret) {
+		dev_err(dev, "SOFT_RESET error: %d\n", ret);
 		return ret;
 	}
 
@@ -3225,17 +3225,18 @@ static int tegra210_sfc_init_put(struct snd_kcontrol *kcontrol,
 
 	if (is_enabled) {
 		u32 val;
+		int cnt = 100;
 
 		regmap_write(sfc->regmap, TEGRA210_SFC_ENABLE, 0);
 
-		ret = regmap_read_poll_timeout(sfc->regmap,
-					       TEGRA210_SFC_STATUS, val,
-					       !(val & 0x1), 10, 10000);
-		if (ret < 0) {
-			dev_err(codec->dev,
-				"failed to disable SFC, err = %d\n", ret);
-			return ret;
+		regmap_read(sfc->regmap, TEGRA210_SFC_STATUS, &val);
+		while ((val & 1) && cnt--) {
+			udelay(100);
+			regmap_read(sfc->regmap, TEGRA210_SFC_STATUS, &val);
 		}
+
+		if (!cnt)
+			dev_warn(codec->dev, "SFC disable timeout\n");
 
 		regmap_update_bits(sfc->regmap,
 				TEGRA210_SFC_COEF_RAM,
@@ -3243,10 +3244,8 @@ static int tegra210_sfc_init_put(struct snd_kcontrol *kcontrol,
 				0);
 
 		ret = tegra210_sfc_soft_reset(sfc);
-		if (ret < 0) {
-			dev_err(codec->dev,
-				"failed to reset SFC in %s, err = %d\n",
-				__func__, ret);
+		if (ret) {
+			dev_err(codec->dev, "SOFT_RESET error: %d\n", ret);
 			goto exit;
 		}
 
